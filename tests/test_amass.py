@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -24,7 +25,7 @@ from amass import (
     parse_lock_file,
     parse_toml_file,
 )
-from amass.cli import cli
+from amass.cli import DEFAULT_OUTPUT_DIR, _resolve_output_dir, cli
 
 TEST_VERSIONS = [
     "0.0.8",
@@ -353,3 +354,182 @@ async def test_dependency_provider_fetch_file(
 def test_is_allowed_asset_type_text_test():
     assert is_allowed_asset_type("text/anything")
     assert not is_allowed_asset_type("application/anything")
+
+
+def test_resolve_output_dir_flag_wins_over_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.amass]\noutput = "configured"\n'
+    )
+
+    assert _resolve_output_dir(output=Path("from_flag")) == Path("from_flag")
+
+
+def test_resolve_output_dir_uses_config_when_no_flag(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.amass]\noutput = "configured"\n'
+    )
+
+    assert _resolve_output_dir(output=None) == Path("configured")
+
+
+def test_resolve_output_dir_default_when_no_flag_no_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.other]\nkey = 1\n")
+
+    assert _resolve_output_dir(output=None) == DEFAULT_OUTPUT_DIR
+
+
+def test_resolve_output_dir_default_when_no_pyproject(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert _resolve_output_dir(output=None) == DEFAULT_OUTPUT_DIR
+
+
+@pytest.fixture
+def mocked_install(monkeypatch):
+    """Patch the install command's network and verification steps.
+
+    download writes a single known asset into the staging directory so the
+    final on-disk destination can be asserted; integrity and map creation are
+    turned into no-ops.
+    """
+
+    async def fake_download(self, *, session, semaphore, output_dir):
+        target = output_dir / "htmx" / "htmx.min.js"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// htmx")
+
+    def noop_check_integrity(self, *, directory):
+        return None
+
+    def noop_create_maps(self, *, directory):
+        return None
+
+    monkeypatch.setattr(LockFile, "download", fake_download)
+    monkeypatch.setattr(LockFile, "check_integrity", noop_check_integrity)
+    monkeypatch.setattr(LockFile, "create_maps", noop_create_maps)
+
+
+def _write_lock_file(directory):
+    (directory / "amass.lock").write_text(json.dumps(TEST_LOCK_FILE))
+
+
+def _assert_installed(output_dir):
+    assert (output_dir / "htmx" / "htmx.min.js").read_text() == "// htmx"
+
+
+def test_install_absolute_output(tmp_path, monkeypatch, mocked_install):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    _write_lock_file(cwd)
+
+    destination = tmp_path / "elsewhere" / "assets"
+
+    result = CliRunner().invoke(cli, ["install", "--output", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(destination)
+
+
+def test_install_relative_output(tmp_path, monkeypatch, mocked_install):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+
+    result = CliRunner().invoke(cli, ["install", "-o", "relative/path"])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(tmp_path / "relative" / "path")
+
+
+def test_install_uses_configured_output(tmp_path, monkeypatch, mocked_install):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.amass]\noutput = "configured_dir"\n'
+    )
+
+    result = CliRunner().invoke(cli, ["install"])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(tmp_path / "configured_dir")
+
+
+def test_install_default_output(tmp_path, monkeypatch, mocked_install):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.other]\nkey = 1\n")
+
+    result = CliRunner().invoke(cli, ["install"])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(tmp_path / DEFAULT_OUTPUT_DIR)
+
+
+def test_install_flag_overrides_config(tmp_path, monkeypatch, mocked_install):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.amass]\noutput = "configured_dir"\n'
+    )
+
+    result = CliRunner().invoke(cli, ["install", "-o", "from_flag"])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(tmp_path / "from_flag")
+    assert not (tmp_path / "configured_dir").exists()
+
+
+def test_install_creates_missing_parents(
+    tmp_path, monkeypatch, mocked_install
+):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+
+    destination = tmp_path / "a" / "b" / "c" / "assets"
+
+    result = CliRunner().invoke(cli, ["install", "--output", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(destination)
+
+
+def test_install_replaces_existing_directory(
+    tmp_path, monkeypatch, mocked_install
+):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+
+    destination = tmp_path / "assets"
+    destination.mkdir()
+    (destination / "stale.txt").write_text("old")
+
+    result = CliRunner().invoke(cli, ["install", "--output", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(destination)
+    assert not (destination / "stale.txt").exists()
+
+
+def test_install_without_pyproject(tmp_path, monkeypatch, mocked_install):
+    monkeypatch.chdir(tmp_path)
+    _write_lock_file(tmp_path)
+
+    destination = tmp_path / "assets"
+
+    result = CliRunner().invoke(cli, ["install", "--output", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    _assert_installed(destination)
+
+
+def test_install_help_lists_output_flag():
+    result = CliRunner().invoke(cli, ["install", "--help"])
+
+    assert result.exit_code == 0
+    assert "--output" in result.output
+    assert "-o" in result.output
