@@ -23,17 +23,34 @@ def coroutine(f: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def _get_settings() -> dict[str, Path]:
-    with open("pyproject.toml") as f:
-        content = f.read()
+DEFAULT_OUTPUT_DIR = Path("vendor")
+
+
+def _get_configured_output() -> Path | None:
+    try:
+        with open("pyproject.toml") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return None
 
     document = tomlkit.parse(content)
+    configured = document.get("tool", {}).get("amass", {}).get("output")
 
-    return {
-        "output_dir": Path(
-            document.get("tool", {}).get("amass", {}).get("output", "vendor")
-        )
-    }
+    if configured is None:
+        return None
+
+    return Path(configured)
+
+
+def _resolve_output_dir(*, output: Path | None) -> Path:
+    if output is not None:
+        return output
+
+    configured = _get_configured_output()
+    if configured is not None:
+        return configured
+
+    return DEFAULT_OUTPUT_DIR
 
 
 @click.group(context_settings=dict(help_option_names=["-h", "--help"]))
@@ -58,8 +75,23 @@ async def lock() -> None:
 @cli.command(
     name="install", short_help="Install the dependencies from the lock file"
 )
+@click.option(
+    "-o",
+    "--output",
+    "output",
+    # types-click's Path stub only allows str/bytes for path_type, but click
+    # supports pathlib.Path at runtime and returns a Path here.
+    type=click.Path(file_okay=False, path_type=Path),  # type: ignore[type-var]
+    default=None,
+    help=(
+        "Directory to install the assets into. Overrides "
+        "[tool.amass].output in pyproject.toml. Absolute paths are used "
+        "as-is; relative paths are resolved against the current working "
+        "directory."
+    ),
+)
 @coroutine
-async def install() -> None:
+async def install(output: Path | None) -> None:
     with open("amass.lock") as f:
         content = json.loads(f.read())
 
@@ -80,7 +112,7 @@ async def install() -> None:
         lock_file.check_integrity(directory=tmp_path)
         lock_file.create_maps(directory=tmp_path)
 
-        output_dir = _get_settings()["output_dir"]
+        output_dir = _resolve_output_dir(output=output)
         if output_dir.exists():
             shutil.rmtree(output_dir)
 

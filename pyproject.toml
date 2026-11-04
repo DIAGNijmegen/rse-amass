@@ -11,7 +11,7 @@ dependencies = [
     "tomlkit",
 ]
 name = "amass"
-version = "0.4.3"
+version = "0.5.0"
 description = "Vendor libraries from cdnjs"
 readme = "README.md"
 classifiers = [
